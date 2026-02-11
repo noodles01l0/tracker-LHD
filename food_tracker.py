@@ -310,6 +310,21 @@ PAGE = r"""
     el.addEventListener('scroll',()=>{req();snap();},{passive:true});
     el.addEventListener('click',(e)=>{const opt=e.target.closest('.opt');if(!opt)return;const idx=o.indexOf(opt);if(idx>=0)scrollToIndex(el,idx,true);});
   }
+  function loadTsIntoPicker(tsMs){
+    const d = new Date(tsMs);
+    const h24 = d.getHours();
+    const m = d.getMinutes();
+    state.ampm = h24 < 12 ? 'AM' : 'PM';
+    let h12 = h24 % 12; if(h12 === 0) h12 = 12;
+    state.hour12 = h12;
+    state.minute = m;
+    
+    scrollToValue(wheelHour, String(state.hour12), true);
+    scrollToValue(wheelMin, pad2(state.minute), true);
+    scrollToValue(wheelAmPm, state.ampm, true);
+    updateDisplay();
+  }
+
 
   // Chart
   function css(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim();}
@@ -370,6 +385,14 @@ PAGE = r"""
     const r=await fetch(`/api/entries/${id}`,{method:'DELETE'});
     return await r.json();
   }
+  async function apiUpdateEntry(id, p){
+    const r = await fetch(`/api/entries/${id}`, {
+      method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(p)
+    });
+    return await r.json();
+  }
   async function apiClearDay(dayIso){
     const r=await fetch(`/api/entries/clear?day=${encodeURIComponent(dayIso)}`,{method:'POST'});
     return await r.json();
@@ -384,6 +407,7 @@ PAGE = r"""
   }
 
   const state={meal:'Breakfast',date:new Date(),hour12:8,minute:0,ampm:'AM'};
+  state.editingId = null;
 
   const wheelHour=document.getElementById('wheelHour');
   const wheelMin=document.getElementById('wheelMin');
@@ -427,9 +451,41 @@ PAGE = r"""
       left.innerHTML=`<b>${entry.meal}</b><br><small>${timeStr} · ${clampInt(entry.calories)} kcal${note}</small>`;
 
       const actions=document.createElement('div'); actions.className='actions';
-      const del=document.createElement('button'); del.className='iconBtn'; del.textContent='Delete';
+
+      const edit=document.createElement('button');
+      edit.className='iconBtn';
+      edit.textContent='Edit';
+      edit.onclick=()=>{
+        // load entry into UI
+        state.editingId = entry.id;
+        
+        // set selected day to entry day
+        state.date = new Date(entry.day + "T00:00:00");
+        document.getElementById('logTitle').textContent = humanDate(state.date);
+        
+        // set meal pill
+        state.meal = entry.meal;
+        [...document.querySelectorAll('#mealRow .pill')].forEach(b=>{
+          b.setAttribute('aria-pressed', b.dataset.meal===state.meal ? 'true' : 'false');
+        });
+        
+        // load time, note, calories
+        loadTsIntoPicker(entry.ts);
+        document.getElementById('note').value = entry.note || '';
+        document.getElementById('calories').value = entry.calories ?? '';
+        
+        // change Save button label
+        document.getElementById('saveBtn').textContent = 'Update';
+      };
+        
+      const del=document.createElement('button');
+      del.className='iconBtn';
+      del.textContent='Delete';
       del.onclick=async()=>{await apiDeleteEntry(entry.id); await refreshAll();};
+        
+      actions.appendChild(edit);
       actions.appendChild(del);
+
 
       div.appendChild(left); div.appendChild(actions); log.appendChild(div);
     }
@@ -460,15 +516,27 @@ PAGE = r"""
     const dayIso=isoDate(state.date);
     const h24=to24h(state.hour12,state.ampm);
     const ts=new Date(dayIso+"T00:00:00"); ts.setHours(h24,state.minute,0,0);
-    await apiAddEntry({
-      day: dayIso, meal: state.meal, ts: ts.getTime(),
+
+    const payload = {
+      day: dayIso,
+      meal: state.meal,
+      ts: ts.getTime(),
       note: document.getElementById('note').value||'',
       calories: clampInt(document.getElementById('calories').value,0),
-    });
-    document.getElementById('note').value='';
-    document.getElementById('calories').value='';
-    await refreshAll();
-  };
+    };
+
+    if(state.editingId){
+      await apiUpdateEntry(state.editingId, payload);
+      state.editingId = null;
+      document.getElementById('saveBtn').textContent = 'Save';
+    } else {
+      await apiAddEntry(payload);
+    }
+    
+      document.getElementById('note').value='';
+      document.getElementById('calories').value='';
+      await refreshAll();
+    };
 
   document.getElementById('saveNowBtn').onclick=async()=>{
     const dayIso=isoDate(state.date);
@@ -569,6 +637,46 @@ def delete_entry(entry_id: int):
         conn.execute("DELETE FROM entries WHERE id=%s", (entry_id,))
     return jsonify({"ok": True})
 
+@app.put("/api/entries/<int:entry_id>")
+def update_entry(entry_id: int):
+    data = request.get_json(force=True, silent=False)
+
+    day = str(data.get("day") or "").strip()
+    meal = str(data.get("meal") or "").strip()
+    ts = data.get("ts")
+    note = str(data.get("note") or "").strip()
+    calories = data.get("calories", 0)
+
+    if not day or not meal or ts is None:
+        return jsonify({"error": "Missing day/meal/ts"}), 400
+
+    try:
+        ts_int = int(ts)
+    except (TypeError, ValueError):
+        return jsonify({"error": "ts must be int (unix ms)"}), 400
+
+    try:
+        cal_int = int(calories)
+        if cal_int < 0:
+            cal_int = 0
+    except (TypeError, ValueError):
+        cal_int = 0
+
+    with db() as conn:
+        row = conn.execute(
+            """
+            UPDATE entries
+            SET day=%s, meal=%s, ts=%s, note=%s, calories=%s
+            WHERE id=%s
+            RETURNING id
+            """,
+            (day, meal, ts_int, note, cal_int, entry_id),
+        ).fetchone()
+
+    if not row:
+        return jsonify({"error": "Entry not found"}), 404
+
+    return jsonify({"ok": True, "id": int(row["id"])})
 
 @app.post("/api/entries/clear")
 def clear_day():
