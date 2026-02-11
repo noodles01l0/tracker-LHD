@@ -1162,8 +1162,9 @@ def export_histogram_24h_csv():
         headers={"Content-Disposition": 'attachment; filename="histogram_24h.csv"'},
     )
 
+with app.app_context():
+    init_db()
 
 if __name__ == "__main__":
-    init_db()
     # LAN hosting:
-    app.run(host="192.168.68.55", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000)
