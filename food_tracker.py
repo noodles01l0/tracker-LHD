@@ -150,7 +150,7 @@ PAGE = r"""
     .fadeTop,.fadeBot{pointer-events:none;position:absolute;left:0;right:0;height:74px;}
     .fadeTop{top:0; background:linear-gradient(180deg, var(--fadeA), var(--fadeB));}
     .fadeBot{bottom:0; background:linear-gradient(0deg, var(--fadeA), var(--fadeB));}
-    .summaryGrid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:10px}
+    .summaryGrid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-top:10px}@media (max-width:900px){.summaryGrid{grid-template-columns:repeat(2,1fr)}}
     @media (max-width:900px){.summaryGrid{grid-template-columns:repeat(2,1fr)}}
     .kpi{border:1px solid var(--stroke);background:var(--bg2);border-radius:16px;padding:10px 12px;min-height:64px}
     .kpi .label{font-size:12px;color:var(--muted)} .kpi .value{font-size:18px;font-weight:900;margin-top:4px}
@@ -236,6 +236,7 @@ PAGE = r"""
           <div class="kpi"><div class="label">Week total</div><div class="value" id="kpiWeek">—</div></div>
           <div class="kpi"><div class="label">Month total</div><div class="value" id="kpiMonth">—</div></div>
           <div class="kpi"><div class="label">All time</div><div class="value" id="kpiAll">—</div></div>
+          <div class="kpi"><div class="label">Avg/day</div><div class="value" id="kpiAvg">—</div></div>
         </div>
 
         <div class="divider"></div>
@@ -504,6 +505,8 @@ PAGE = r"""
     document.getElementById('kpiWeek').textContent=kcal(s.week_total||0);
     document.getElementById('kpiMonth').textContent=kcal(s.month_total||0);
     document.getElementById('kpiAll').textContent=kcal(s.all_total||0);
+    document.getElementById('kpiAvg').textContent=kcal(s.avg_daily||0);
+    document.getElementById('kpiAvg').textContent =`${kcal(s.avg_daily||0)}${s.days_with_entries ? ` (${s.days_with_entries}d)` : ''}`;
   }
 
   async function refreshAll(){
@@ -715,7 +718,9 @@ def summary():
         week_total = sum_calories_between(conn, w0, w1)
         month_total = sum_calories_between(conn, m0, m1)
         all_total = int(conn.execute("SELECT COALESCE(SUM(calories),0) AS total FROM entries").fetchone()["total"] or 0)
-
+        days_with_entries = int(conn.execute("SELECT COUNT(DISTINCT day) AS c FROM entries").fetchone()["c"] or 0)
+        avg_daily = round(all_total / days_with_entries) if days_with_entries > 0 else 0
+    
     return jsonify(
         {
             "day": day_str,
@@ -723,6 +728,8 @@ def summary():
             "week_total": week_total,
             "month_total": month_total,
             "all_total": all_total,
+            "avg_daily": avg_daily,
+            "days_with_entries": days_with_entries,
         }
     )
 
