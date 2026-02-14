@@ -7,6 +7,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 from flask import Flask, Response, jsonify, render_template_string, request
+import csv, io
 
 app = Flask(__name__)
 
@@ -74,6 +75,53 @@ def sum_calories_between(conn: psycopg.Connection, start_day: date, end_day: dat
     ).fetchone()
     return int(row["total"] or 0)
 
+#=== export csv ====
+
+@app.get("/export/meals.csv")
+def export_meals_csv():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, day, meal, ts, note, calories FROM entries ORDER BY day ASC, ts ASC"
+        ).fetchall()
+
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["id", "day", "meal", "time_local", "timestamp_ms", "calories", "note"])
+
+    for r in rows:
+        ts_ms = int(r["ts"])
+        # keep it simple: browser/local interpretation; store both readable + raw
+        # If you want timezone-correct formatting server-side, tell me your timezone.
+        w.writerow([r["id"], r["day"], r["meal"], "", ts_ms, r["calories"], r["note"]])
+
+    return Response(
+        out.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="meals.csv"'},
+    )
+
+@app.get("/export/meals.csv")
+def export_meals_csv():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, day, meal, ts, note, calories FROM entries ORDER BY day ASC, ts ASC"
+        ).fetchall()
+
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["id", "day", "meal", "time_local", "timestamp_ms", "calories", "note"])
+
+    for r in rows:
+        ts_ms = int(r["ts"])
+        # keep it simple: browser/local interpretation; store both readable + raw
+        # If you want timezone-correct formatting server-side, tell me your timezone.
+        w.writerow([r["id"], r["day"], r["meal"], "", ts_ms, r["calories"], r["note"]])
+
+    return Response(
+        out.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="meals.csv"'},
+    )
 
 # ==================== UI ====================
 PAGE = r"""
@@ -216,6 +264,8 @@ PAGE = r"""
           <button class="btn" id="saveBtn">Save</button>
           <button class="btn secondary" id="saveNowBtn">Save Now</button>
           <button class="btn secondary" id="clearDayBtn">Clear Day</button>
+          <button class="btn secondary" id="exportMealsBtn">Export meals</button>
+          <button class="btn secondary" id="exportHistoBtn">Export histogram</button>
         </div>
       </div>
 
@@ -561,6 +611,12 @@ PAGE = r"""
     if(!confirm('Clear all entries for this day?'))return;
     await apiClearDay(dayIso);
     await refreshAll();
+  };
+
+  document.getElementById('exportMealsBtn').onclick = () => {window.location.href = '/export/meals.csv';
+  };
+
+  document.getElementById('exportHistoBtn').onclick = () => {window.location.href = '/export/histogram.csv';
   };
 
   document.getElementById('prevDay').onclick=async()=>{state.date=new Date(state.date.getTime()-86400000); await refreshAll();};
