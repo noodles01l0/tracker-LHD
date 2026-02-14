@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import os
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -7,17 +9,15 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 from flask import Flask, Response, jsonify, render_template_string, request
-import csv, io
 
 app = Flask(__name__)
 
 
-# ==================== DB (Postgres) ====================
+# ===================== DB (Postgres) =====================
 def db() -> psycopg.Connection:
     url = os.environ.get("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL is not set (Render env var missing).")
-    # Render provides a postgres URL that psycopg understands.
     return psycopg.connect(url, row_factory=dict_row)
 
 
@@ -47,7 +47,7 @@ def rows_to_dicts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-# ==================== date helpers ====================
+# ===================== Date helpers =====================
 def parse_iso_day(day_str: str) -> date:
     return datetime.strptime(day_str, "%Y-%m-%d").date()
 
@@ -75,10 +75,11 @@ def sum_calories_between(conn: psycopg.Connection, start_day: date, end_day: dat
     ).fetchone()
     return int(row["total"] or 0)
 
-#=== export csv ====
 
+# ===================== Exports (CSV) =====================
 @app.get("/export/meals.csv")
 def export_meals_csv():
+    """All entries as CSV (download)."""
     with db() as conn:
         rows = conn.execute(
             "SELECT id, day, meal, ts, note, calories FROM entries ORDER BY day ASC, ts ASC"
@@ -86,13 +87,23 @@ def export_meals_csv():
 
     out = io.StringIO()
     w = csv.writer(out)
-    w.writerow(["id", "day", "meal", "time_local", "timestamp_ms", "calories", "note"])
+    w.writerow(["id", "day", "meal", "timestamp_ms", "local_time_guess", "calories", "note"])
 
     for r in rows:
         ts_ms = int(r["ts"])
-        # keep it simple: browser/local interpretation; store both readable + raw
-        # If you want timezone-correct formatting server-side, tell me your timezone.
-        w.writerow([r["id"], r["day"], r["meal"], "", ts_ms, r["calories"], r["note"]])
+        # Server-side "guess" of local time (server timezone). Keep raw timestamp for correctness.
+        dt_guess = datetime.fromtimestamp(ts_ms / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+        w.writerow(
+            [
+                int(r["id"]),
+                r["day"],
+                r["meal"],
+                ts_ms,
+                dt_guess,
+                int(r["calories"] or 0),
+                r["note"] or "",
+            ]
+        )
 
     return Response(
         out.getvalue(),
@@ -100,30 +111,36 @@ def export_meals_csv():
         headers={"Content-Disposition": 'attachment; filename="meals.csv"'},
     )
 
-@app.get("/export/meals.csv")
-def export_meals_csv():
+
+@app.get("/export/histogram.csv")
+def export_histogram_csv():
+    """24-row histogram CSV: hour_24, meal_count, total_calories (all time)."""
+    counts = [0] * 24
+    cal_totals = [0] * 24
+
     with db() as conn:
-        rows = conn.execute(
-            "SELECT id, day, meal, ts, note, calories FROM entries ORDER BY day ASC, ts ASC"
-        ).fetchall()
+        rows = conn.execute("SELECT ts, calories FROM entries").fetchall()
+
+    for r in rows:
+        ts_ms = int(r["ts"])
+        hr = datetime.fromtimestamp(ts_ms / 1000.0).hour
+        counts[hr] += 1
+        cal_totals[hr] += int(r["calories"] or 0)
 
     out = io.StringIO()
     w = csv.writer(out)
-    w.writerow(["id", "day", "meal", "time_local", "timestamp_ms", "calories", "note"])
-
-    for r in rows:
-        ts_ms = int(r["ts"])
-        # keep it simple: browser/local interpretation; store both readable + raw
-        # If you want timezone-correct formatting server-side, tell me your timezone.
-        w.writerow([r["id"], r["day"], r["meal"], "", ts_ms, r["calories"], r["note"]])
+    w.writerow(["hour_24", "meal_count", "total_calories"])
+    for h in range(24):
+        w.writerow([h, counts[h], cal_totals[h]])
 
     return Response(
         out.getvalue(),
         mimetype="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="meals.csv"'},
+        headers={"Content-Disposition": 'attachment; filename="histogram.csv"'},
     )
 
-# ==================== UI ====================
+
+# ===================== UI =====================
 PAGE = r"""
 <!doctype html>
 <html lang="en" data-theme="auto">
@@ -198,7 +215,7 @@ PAGE = r"""
     .fadeTop,.fadeBot{pointer-events:none;position:absolute;left:0;right:0;height:74px;}
     .fadeTop{top:0; background:linear-gradient(180deg, var(--fadeA), var(--fadeB));}
     .fadeBot{bottom:0; background:linear-gradient(0deg, var(--fadeA), var(--fadeB));}
-    .summaryGrid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-top:10px}@media (max-width:900px){.summaryGrid{grid-template-columns:repeat(2,1fr)}}
+    .summaryGrid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-top:10px}
     @media (max-width:900px){.summaryGrid{grid-template-columns:repeat(2,1fr)}}
     .kpi{border:1px solid var(--stroke);background:var(--bg2);border-radius:16px;padding:10px 12px;min-height:64px}
     .kpi .label{font-size:12px;color:var(--muted)} .kpi .value{font-size:18px;font-weight:900;margin-top:4px}
@@ -216,7 +233,7 @@ PAGE = r"""
     <div class="topbar">
       <div>
         <h1>Meal Time Tracker</h1>
-        <p>Permanent storage via Postgres (Render). Editing + calories totals + all-time histogram.</p>
+        <p>Postgres storage + editing + totals + all-time histogram + CSV export.</p>
       </div>
       <div class="row">
         <button class="iconBtn" id="themeToggle">Theme</button>
@@ -266,6 +283,10 @@ PAGE = r"""
           <button class="btn secondary" id="clearDayBtn">Clear Day</button>
           <button class="btn secondary" id="exportMealsBtn">Export meals</button>
           <button class="btn secondary" id="exportHistoBtn">Export histogram</button>
+        </div>
+
+        <div class="sub" style="margin-top:10px">
+          Tip: click “Edit” on a log item to load it into the picker.
         </div>
       </div>
 
@@ -322,37 +343,50 @@ PAGE = r"""
 
   // Wheel (smooth)
   const ROW_H=44, OUTER_H=238, SPACER_H=(OUTER_H-ROW_H)/2;
+
   function buildWheel(el,items){
     el.innerHTML='';
     const top=document.createElement('div');top.className='spacer';
     const bot=document.createElement('div');bot.className='spacer';
     el.appendChild(top);
-    for(const v of items){const d=document.createElement('div');d.className='opt';d.textContent=v;d.dataset.value=v;el.appendChild(d);}
+    for(const v of items){
+      const d=document.createElement('div');
+      d.className='opt';
+      d.textContent=v;
+      d.dataset.value=v;
+      el.appendChild(d);
+    }
     el.appendChild(bot);
   }
+
   function opts(el){return [...el.querySelectorAll('.opt')];}
+
   function selectedIndex(el,count){
     const center=el.scrollTop+OUTER_H/2;
     const raw=(center-SPACER_H-ROW_H/2)/ROW_H;
     const idx=Math.round(raw);
     return Math.max(0,Math.min(count-1,idx));
   }
+
   function setActive(el,idx){
     const o=opts(el);
     for(let i=0;i<o.length;i++){o[i].classList.toggle('active',i===idx);}
     return o[idx]?.dataset.value;
   }
+
   function scrollToIndex(el,idx,smooth=false){
     const targetCenter=SPACER_H+idx*ROW_H+ROW_H/2;
     const targetTop=targetCenter-OUTER_H/2;
     el.scrollTo({top:targetTop,behavior:smooth?'smooth':'auto'});
     setActive(el,idx);
   }
+
   function scrollToValue(el,val,smooth=false){
     const o=opts(el);
     const idx=o.findIndex(x=>x.dataset.value==val);
     if(idx>=0)scrollToIndex(el,idx,smooth);
   }
+
   function attachWheel(el,onVal){
     const o=opts(el); let raf=false,last=-1,t=null;
     function tick(){raf=false;const idx=selectedIndex(el,o.length);if(idx!==last){last=idx;const v=setActive(el,idx);if(v!=null)onVal(v);}}
@@ -361,6 +395,7 @@ PAGE = r"""
     el.addEventListener('scroll',()=>{req();snap();},{passive:true});
     el.addEventListener('click',(e)=>{const opt=e.target.closest('.opt');if(!opt)return;const idx=o.indexOf(opt);if(idx>=0)scrollToIndex(el,idx,true);});
   }
+
   function loadTsIntoPicker(tsMs){
     const d = new Date(tsMs);
     const h24 = d.getHours();
@@ -369,13 +404,12 @@ PAGE = r"""
     let h12 = h24 % 12; if(h12 === 0) h12 = 12;
     state.hour12 = h12;
     state.minute = m;
-    
+
     scrollToValue(wheelHour, String(state.hour12), true);
     scrollToValue(wheelMin, pad2(state.minute), true);
     scrollToValue(wheelAmPm, state.ampm, true);
     updateDisplay();
   }
-
 
   // Chart
   function css(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim();}
@@ -386,8 +420,10 @@ PAGE = r"""
     const dpr=window.devicePixelRatio||1;
     c.width=Math.round(cssW*dpr); c.height=Math.round(cssH*dpr);
     ctx.setTransform(dpr,0,0,dpr,0,0);
+
     const W=cssW,H=cssH;
     ctx.clearRect(0,0,W,H);
+
     const padL=34,padR=14,padT=14,padB=28;
     const chartW=W-padL-padR, chartH=H-padT-padB;
     const maxVal=Math.max(1,...counts);
@@ -457,12 +493,12 @@ PAGE = r"""
     return await r.json();
   }
 
-  const state={meal:'Breakfast',date:new Date(),hour12:8,minute:0,ampm:'AM'};
-  state.editingId = null;
+  const state={meal:'Breakfast',date:new Date(),hour12:8,minute:0,ampm:'AM', editingId:null};
 
   const wheelHour=document.getElementById('wheelHour');
   const wheelMin=document.getElementById('wheelMin');
   const wheelAmPm=document.getElementById('wheelAmPm');
+
   buildWheel(wheelHour,Array.from({length:12},(_,i)=>String(i+1)));
   buildWheel(wheelMin,Array.from({length:60},(_,i)=>String(i).padStart(2,'0')));
   buildWheel(wheelAmPm,['AM','PM']);
@@ -471,6 +507,7 @@ PAGE = r"""
     const h24=to24h(state.hour12,state.ampm);
     document.getElementById('timeDisplay').textContent=format12h(h24,state.minute);
   }
+
   attachWheel(wheelHour,(v)=>{state.hour12=parseInt(v,10);updateDisplay();});
   attachWheel(wheelMin,(v)=>{state.minute=parseInt(v,10);updateDisplay();});
   attachWheel(wheelAmPm,(v)=>{state.ampm=v;updateDisplay();});
@@ -483,11 +520,16 @@ PAGE = r"""
     btn.setAttribute('aria-pressed','true');
   });
 
+  function setSaveModeEditing(isEditing){
+    document.getElementById('saveBtn').textContent = isEditing ? 'Update' : 'Save';
+  }
+
   async function renderLog(){
     const dayIso=isoDate(state.date);
     document.getElementById('logTitle').textContent=humanDate(state.date);
-    const entries=(await apiGetEntries(dayIso)).entries||[];
-    entries.sort((a,b)=>a.ts-b.ts);
+
+    const resp = await apiGetEntries(dayIso);
+    const entries=(resp.entries||[]).slice().sort((a,b)=>a.ts-b.ts);
 
     const log=document.getElementById('log');
     log.innerHTML='';
@@ -495,6 +537,7 @@ PAGE = r"""
 
     for(const entry of entries){
       const div=document.createElement('div'); div.className='logItem';
+
       const left=document.createElement('div');
       const t=new Date(entry.ts);
       const timeStr=format12h(t.getHours(),t.getMinutes());
@@ -507,38 +550,39 @@ PAGE = r"""
       edit.className='iconBtn';
       edit.textContent='Edit';
       edit.onclick=()=>{
-        // load entry into UI
         state.editingId = entry.id;
-        
-        // set selected day to entry day
         state.date = new Date(entry.day + "T00:00:00");
-        document.getElementById('logTitle').textContent = humanDate(state.date);
-        
-        // set meal pill
         state.meal = entry.meal;
+
         [...document.querySelectorAll('#mealRow .pill')].forEach(b=>{
           b.setAttribute('aria-pressed', b.dataset.meal===state.meal ? 'true' : 'false');
         });
-        
-        // load time, note, calories
+
         loadTsIntoPicker(entry.ts);
         document.getElementById('note').value = entry.note || '';
-        document.getElementById('calories').value = entry.calories ?? '';
-        
-        // change Save button label
-        document.getElementById('saveBtn').textContent = 'Update';
+        document.getElementById('calories').value = (entry.calories ?? '') === 0 ? '' : (entry.calories ?? '');
+
+        setSaveModeEditing(true);
       };
-        
+
       const del=document.createElement('button');
       del.className='iconBtn';
       del.textContent='Delete';
-      del.onclick=async()=>{await apiDeleteEntry(entry.id); await refreshAll();};
-        
+      del.onclick=async()=>{
+        await apiDeleteEntry(entry.id);
+        if(state.editingId === entry.id){
+          state.editingId = null;
+          setSaveModeEditing(false);
+        }
+        await refreshAll();
+      };
+
       actions.appendChild(edit);
       actions.appendChild(del);
 
-
-      div.appendChild(left); div.appendChild(actions); log.appendChild(div);
+      div.appendChild(left);
+      div.appendChild(actions);
+      log.appendChild(div);
     }
   }
 
@@ -555,8 +599,7 @@ PAGE = r"""
     document.getElementById('kpiWeek').textContent=kcal(s.week_total||0);
     document.getElementById('kpiMonth').textContent=kcal(s.month_total||0);
     document.getElementById('kpiAll').textContent=kcal(s.all_total||0);
-    document.getElementById('kpiAvg').textContent=kcal(s.avg_daily||0);
-    document.getElementById('kpiAvg').textContent =`${kcal(s.avg_daily||0)}${s.days_with_entries ? ` (${s.days_with_entries}d)` : ''}`;
+    document.getElementById('kpiAvg').textContent = `${kcal(s.avg_daily||0)}${s.days_with_entries ? ` (${s.days_with_entries}d)` : ''}`;
   }
 
   async function refreshAll(){
@@ -568,7 +611,9 @@ PAGE = r"""
   document.getElementById('saveBtn').onclick=async()=>{
     const dayIso=isoDate(state.date);
     const h24=to24h(state.hour12,state.ampm);
-    const ts=new Date(dayIso+"T00:00:00"); ts.setHours(h24,state.minute,0,0);
+
+    const ts=new Date(dayIso+"T00:00:00");
+    ts.setHours(h24,state.minute,0,0);
 
     const payload = {
       day: dayIso,
@@ -581,26 +626,35 @@ PAGE = r"""
     if(state.editingId){
       await apiUpdateEntry(state.editingId, payload);
       state.editingId = null;
-      document.getElementById('saveBtn').textContent = 'Save';
+      setSaveModeEditing(false);
     } else {
       await apiAddEntry(payload);
     }
-    
-      document.getElementById('note').value='';
-      document.getElementById('calories').value='';
-      await refreshAll();
-    };
+
+    document.getElementById('note').value='';
+    document.getElementById('calories').value='';
+    await refreshAll();
+  };
 
   document.getElementById('saveNowBtn').onclick=async()=>{
     const dayIso=isoDate(state.date);
     const now=new Date();
+
     const ts=new Date(dayIso+"T00:00:00");
-    if(isoDate(now)===dayIso){ts.setHours(now.getHours(),now.getMinutes(),0,0);} else {ts.setHours(12,0,0,0);}
+    if(isoDate(now)===dayIso){
+      ts.setHours(now.getHours(),now.getMinutes(),0,0);
+    } else {
+      ts.setHours(12,0,0,0);
+    }
+
     await apiAddEntry({
-      day: dayIso, meal: state.meal, ts: ts.getTime(),
+      day: dayIso,
+      meal: state.meal,
+      ts: ts.getTime(),
       note: document.getElementById('note').value||'',
       calories: clampInt(document.getElementById('calories').value,0),
     });
+
     document.getElementById('note').value='';
     document.getElementById('calories').value='';
     await refreshAll();
@@ -610,13 +664,15 @@ PAGE = r"""
     const dayIso=isoDate(state.date);
     if(!confirm('Clear all entries for this day?'))return;
     await apiClearDay(dayIso);
+    if(state.editingId){ state.editingId = null; setSaveModeEditing(false); }
     await refreshAll();
   };
 
-  document.getElementById('exportMealsBtn').onclick = () => {window.location.href = '/export/meals.csv';
+  document.getElementById('exportMealsBtn').onclick = () => {
+    window.location.href = '/export/meals.csv';
   };
-
-  document.getElementById('exportHistoBtn').onclick = () => {window.location.href = '/export/histogram.csv';
+  document.getElementById('exportHistoBtn').onclick = () => {
+    window.location.href = '/export/histogram.csv';
   };
 
   document.getElementById('prevDay').onclick=async()=>{state.date=new Date(state.date.getTime()-86400000); await refreshAll();};
@@ -631,6 +687,7 @@ PAGE = r"""
     scrollToValue(wheelMin,pad2(state.minute),false);
     scrollToValue(wheelAmPm,state.ampm,false);
     updateDisplay();
+    setSaveModeEditing(false);
     await refreshAll();
   });
 </script>
@@ -639,7 +696,7 @@ PAGE = r"""
 """
 
 
-# ==================== routes ====================
+# ===================== Routes =====================
 @app.get("/")
 def index():
     return render_template_string(PAGE)
@@ -690,12 +747,6 @@ def add_entry():
     return jsonify({"ok": True, "id": int(row["id"])})
 
 
-@app.delete("/api/entries/<int:entry_id>")
-def delete_entry(entry_id: int):
-    with db() as conn:
-        conn.execute("DELETE FROM entries WHERE id=%s", (entry_id,))
-    return jsonify({"ok": True})
-
 @app.put("/api/entries/<int:entry_id>")
 def update_entry(entry_id: int):
     data = request.get_json(force=True, silent=False)
@@ -737,6 +788,14 @@ def update_entry(entry_id: int):
 
     return jsonify({"ok": True, "id": int(row["id"])})
 
+
+@app.delete("/api/entries/<int:entry_id>")
+def delete_entry(entry_id: int):
+    with db() as conn:
+        conn.execute("DELETE FROM entries WHERE id=%s", (entry_id,))
+    return jsonify({"ok": True})
+
+
 @app.post("/api/entries/clear")
 def clear_day():
     day = request.args.get("day") or iso_today()
@@ -773,10 +832,21 @@ def summary():
         day_total = sum_calories_between(conn, d, d)
         week_total = sum_calories_between(conn, w0, w1)
         month_total = sum_calories_between(conn, m0, m1)
-        all_total = int(conn.execute("SELECT COALESCE(SUM(calories),0) AS total FROM entries").fetchone()["total"] or 0)
-        days_with_entries = int(conn.execute("SELECT COUNT(DISTINCT day) AS c FROM entries").fetchone()["c"] or 0)
+
+        all_total = int(
+            conn.execute("SELECT COALESCE(SUM(calories),0) AS total FROM entries")
+            .fetchone()["total"]
+            or 0
+        )
+
+        days_with_entries = int(
+            conn.execute("SELECT COUNT(DISTINCT day) AS c FROM entries")
+            .fetchone()["c"]
+            or 0
+        )
+
         avg_daily = round(all_total / days_with_entries) if days_with_entries > 0 else 0
-    
+
     return jsonify(
         {
             "day": day_str,
@@ -790,37 +860,5 @@ def summary():
     )
 
 
-@app.get("/export/entries.csv")
-def export_entries_csv():
-    with db() as conn:
-        rows = conn.execute("SELECT id, day, meal, ts, note, calories FROM entries ORDER BY day ASC, ts ASC").fetchall()
-
-    lines = ["id,day,meal,ts_iso,ts_ms,calories,note"]
-    for r in rows:
-        dt_local = datetime.fromtimestamp(int(r["ts"]) / 1000.0)
-        ts_iso = dt_local.strftime("%Y-%m-%d %H:%M:%S")
-        meal = (r["meal"] or "").replace('"', '""')
-        note = (r["note"] or "").replace('"', '""')
-        cal = int(r["calories"] or 0)
-        lines.append(f'{r["id"]},{r["day"]},"{meal}",{ts_iso},{r["ts"]},{cal},"{note}"')
-
-    data = "\n".join(lines) + "\n"
-    return Response(data, mimetype="text/csv", headers={"Content-Disposition": 'attachment; filename="entries.csv"'})
-
-
-@app.get("/export/histogram_24h.csv")
-def export_histogram_24h_csv():
-    counts = [0] * 24
-    with db() as conn:
-        rows = conn.execute("SELECT ts FROM entries").fetchall()
-    for r in rows:
-        hour = datetime.fromtimestamp(int(r["ts"]) / 1000.0).hour
-        counts[hour] += 1
-
-    lines = ["hour,count"] + [f"{h},{counts[h]}" for h in range(24)]
-    data = "\n".join(lines) + "\n"
-    return Response(data, mimetype="text/csv", headers={"Content-Disposition": 'attachment; filename="histogram_24h.csv"'})
-
-
-# IMPORTANT: make sure the table exists when Gunicorn imports this module
+# Ensure table exists at import time (Gunicorn)
 init_db()
