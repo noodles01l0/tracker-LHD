@@ -1,26 +1,59 @@
 from __future__ import annotations
 
+import csv
+import io
 import os
+import threading
+import time
 from datetime import date, datetime, timedelta
 from typing import Any
 
 import psycopg
+from psycopg import OperationalError
 from psycopg.rows import dict_row
 from flask import Flask, Response, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
+# -------------------- DB helpers --------------------
 
-# ==================== DB (Postgres) ====================
+_DB_READY = False
+_DB_LOCK = threading.Lock()
+
+
 def db() -> psycopg.Connection:
+    """
+    Create a short-lived DB connection with timeout + retries.
+    This prevents requests from hanging (Cloudflare 524) and reduces 502/503.
+    """
     url = os.environ.get("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL is not set (Render env var missing).")
-    # Render provides a postgres URL that psycopg understands.
-    return psycopg.connect(url, row_factory=dict_row)
+
+    last_err: Exception | None = None
+
+    # Keep overall wait small so Cloudflare doesn't time out
+    for attempt in range(1, 7):  # ~ (connect_timeout + sleep) * 6 ~= under ~30s worst-case
+        try:
+            # statement_timeout makes any query fail fast rather than hang forever
+            return psycopg.connect(
+                url,
+                row_factory=dict_row,
+                connect_timeout=4,
+                options="-c statement_timeout=8000",
+            )
+        except OperationalError as e:
+            last_err = e
+            # small backoff
+            time.sleep(min(1.5 * attempt, 6))
+
+    raise last_err or RuntimeError("DB connection failed (unknown error)")
 
 
 def init_db() -> None:
+    """
+    Create tables/indexes. Safe to run multiple times.
+    """
     with db() as conn:
         conn.execute(
             """
@@ -28,7 +61,7 @@ def init_db() -> None:
               id SERIAL PRIMARY KEY,
               day TEXT NOT NULL,              -- YYYY-MM-DD
               meal TEXT NOT NULL,
-              ts BIGINT NOT NULL,             -- unix ms (client local time)
+              ts BIGINT NOT NULL,             -- unix ms
               note TEXT NOT NULL DEFAULT '',
               calories INTEGER NOT NULL DEFAULT 0
             );
@@ -38,15 +71,28 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_ts ON entries(ts);")
 
 
+def ensure_db_ready() -> None:
+    """
+    Lazy init: don't crash the whole server if DB is temporarily down.
+    We try init once, cache success. If it fails, we will retry on future requests.
+    """
+    global _DB_READY
+    if _DB_READY:
+        return
+
+    with _DB_LOCK:
+        if _DB_READY:
+            return
+        init_db()
+        _DB_READY = True
+
+
+# -------------------- date helpers --------------------
+
 def iso_today() -> str:
     return date.today().isoformat()
 
 
-def rows_to_dicts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [dict(r) for r in rows]
-
-
-# ==================== date helpers ====================
 def parse_iso_day(day_str: str) -> date:
     return datetime.strptime(day_str, "%Y-%m-%d").date()
 
@@ -75,7 +121,12 @@ def sum_calories_between(conn: psycopg.Connection, start_day: date, end_day: dat
     return int(row["total"] or 0)
 
 
-# ==================== UI ====================
+def rows_to_dicts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(r) for r in rows]
+
+
+# -------------------- UI --------------------
+
 PAGE = r"""
 <!doctype html>
 <html lang="en" data-theme="auto">
@@ -84,7 +135,7 @@ PAGE = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Meal Time Tracker</title>
   <style>
-    :root{--radius:22px;--rowH:44px;--wheelH:238px;--wheelW:140px;--wheelW2:95px;--accent:#5b8cff;--danger:#ff5b5b;}
+    :root{--radius:22px;--rowH:44px;--wheelH:238px;--wheelW:140px;--wheelW2:95px;--accent:#5b8cff;}
     :root[data-theme="dark"], :root[data-theme="auto"]{
       --bg:#0b0b10;--bg2:rgba(255,255,255,.06);--card1:rgba(255,255,255,.07);--card2:rgba(255,255,255,.03);
       --stroke:rgba(255,255,255,.12);--stroke2:rgba(255,255,255,.18);--text:#f2f2f7;--muted:rgba(242,242,247,.60);
@@ -150,7 +201,7 @@ PAGE = r"""
     .fadeTop,.fadeBot{pointer-events:none;position:absolute;left:0;right:0;height:74px;}
     .fadeTop{top:0; background:linear-gradient(180deg, var(--fadeA), var(--fadeB));}
     .fadeBot{bottom:0; background:linear-gradient(0deg, var(--fadeA), var(--fadeB));}
-    .summaryGrid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-top:10px}@media (max-width:900px){.summaryGrid{grid-template-columns:repeat(2,1fr)}}
+    .summaryGrid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-top:10px}
     @media (max-width:900px){.summaryGrid{grid-template-columns:repeat(2,1fr)}}
     .kpi{border:1px solid var(--stroke);background:var(--bg2);border-radius:16px;padding:10px 12px;min-height:64px}
     .kpi .label{font-size:12px;color:var(--muted)} .kpi .value{font-size:18px;font-weight:900;margin-top:4px}
@@ -160,6 +211,7 @@ PAGE = r"""
     .actions{display:flex;gap:8px}
     canvas{display:block}
     .chartCanvas{width:100%;height:230px;border-radius:18px;border:1px solid var(--stroke);background:var(--chartBg)}
+    .warn{border:1px solid rgba(255,180,0,.35); background:rgba(255,180,0,.10); padding:10px 12px; border-radius:14px; color:var(--text);}
   </style>
 </head>
 
@@ -168,11 +220,15 @@ PAGE = r"""
     <div class="topbar">
       <div>
         <h1>Meal Time Tracker</h1>
-        <p>Permanent storage via Postgres (Render). Editing + calories totals + all-time histogram.</p>
+        <p>Permanent storage via Postgres (Render). Editing + calories totals + all-time histogram + CSV exports.</p>
       </div>
       <div class="row">
         <button class="iconBtn" id="themeToggle">Theme</button>
       </div>
+    </div>
+
+    <div id="dbWarn" class="warn" style="display:none;margin-top:10px">
+      Database is temporarily unavailable (or waking up). Try again in a moment.
     </div>
 
     <div class="grid">
@@ -216,6 +272,8 @@ PAGE = r"""
           <button class="btn" id="saveBtn">Save</button>
           <button class="btn secondary" id="saveNowBtn">Save Now</button>
           <button class="btn secondary" id="clearDayBtn">Clear Day</button>
+          <button class="btn secondary" id="exportMealsBtn">Export meals</button>
+          <button class="btn secondary" id="exportHistoBtn">Export histogram</button>
         </div>
       </div>
 
@@ -261,7 +319,6 @@ PAGE = r"""
   document.getElementById("themeToggle").addEventListener("click",cycleTheme);
   setTheme(getTheme());
 
-  // Helpers
   const pad2=n=>String(n).padStart(2,'0');
   function format12h(h,m){const am=h<12;let hh=h%12;if(hh===0)hh=12;return `${pad2(hh)}:${pad2(m)} ${am?'AM':'PM'}`;}
   function to24h(h12,ap){if(ap==='AM')return h12===12?0:h12;return h12===12?12:h12+12;}
@@ -270,7 +327,7 @@ PAGE = r"""
   function clampInt(v,def=0){const n=Number(v);if(!Number.isFinite(n))return def;return Math.max(0,Math.floor(n));}
   function kcal(n){return `${clampInt(n)} kcal`;}
 
-  // Wheel (smooth)
+  // Wheels
   const ROW_H=44, OUTER_H=238, SPACER_H=(OUTER_H-ROW_H)/2;
   function buildWheel(el,items){
     el.innerHTML='';
@@ -319,13 +376,11 @@ PAGE = r"""
     let h12 = h24 % 12; if(h12 === 0) h12 = 12;
     state.hour12 = h12;
     state.minute = m;
-    
     scrollToValue(wheelHour, String(state.hour12), true);
     scrollToValue(wheelMin, pad2(state.minute), true);
     scrollToValue(wheelAmPm, state.ampm, true);
     updateDisplay();
   }
-
 
   // Chart
   function css(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim();}
@@ -373,42 +428,23 @@ PAGE = r"""
     ctx.textAlign="start";
   }
 
+  function showDbWarn(on){
+    document.getElementById('dbWarn').style.display = on ? 'block' : 'none';
+  }
+
   // API
-  async function apiGetEntries(dayIso){
-    const r=await fetch(`/api/entries?day=${encodeURIComponent(dayIso)}`);
+  async function jget(url){
+    const r = await fetch(url);
+    if(!r.ok) throw new Error("HTTP "+r.status);
     return await r.json();
   }
-  async function apiAddEntry(p){
-    const r=await fetch('/api/entries',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
-    return await r.json();
-  }
-  async function apiDeleteEntry(id){
-    const r=await fetch(`/api/entries/${id}`,{method:'DELETE'});
-    return await r.json();
-  }
-  async function apiUpdateEntry(id, p){
-    const r = await fetch(`/api/entries/${id}`, {
-      method:'PUT',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(p)
-    });
-    return await r.json();
-  }
-  async function apiClearDay(dayIso){
-    const r=await fetch(`/api/entries/clear?day=${encodeURIComponent(dayIso)}`,{method:'POST'});
-    return await r.json();
-  }
-  async function apiGetHistogramAll(){
-    const r=await fetch('/api/histogram/all');
-    return await r.json();
-  }
-  async function apiGetSummary(dayIso){
-    const r=await fetch(`/api/summary?day=${encodeURIComponent(dayIso)}`);
+  async function jsend(url, method, body){
+    const r = await fetch(url, {method, headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    if(!r.ok) throw new Error("HTTP "+r.status);
     return await r.json();
   }
 
-  const state={meal:'Breakfast',date:new Date(),hour12:8,minute:0,ampm:'AM'};
-  state.editingId = null;
+  const state={meal:'Breakfast',date:new Date(),hour12:8,minute:0,ampm:'AM', editingId:null};
 
   const wheelHour=document.getElementById('wheelHour');
   const wheelMin=document.getElementById('wheelMin');
@@ -436,8 +472,8 @@ PAGE = r"""
   async function renderLog(){
     const dayIso=isoDate(state.date);
     document.getElementById('logTitle').textContent=humanDate(state.date);
-    const entries=(await apiGetEntries(dayIso)).entries||[];
-    entries.sort((a,b)=>a.ts-b.ts);
+    const data = await jget(`/api/entries?day=${encodeURIComponent(dayIso)}`);
+    const entries=(data.entries||[]).sort((a,b)=>a.ts-b.ts);
 
     const log=document.getElementById('log');
     log.innerHTML='';
@@ -457,62 +493,61 @@ PAGE = r"""
       edit.className='iconBtn';
       edit.textContent='Edit';
       edit.onclick=()=>{
-        // load entry into UI
         state.editingId = entry.id;
-        
-        // set selected day to entry day
         state.date = new Date(entry.day + "T00:00:00");
-        document.getElementById('logTitle').textContent = humanDate(state.date);
-        
-        // set meal pill
         state.meal = entry.meal;
+
         [...document.querySelectorAll('#mealRow .pill')].forEach(b=>{
           b.setAttribute('aria-pressed', b.dataset.meal===state.meal ? 'true' : 'false');
         });
-        
-        // load time, note, calories
+
         loadTsIntoPicker(entry.ts);
         document.getElementById('note').value = entry.note || '';
         document.getElementById('calories').value = entry.calories ?? '';
-        
-        // change Save button label
         document.getElementById('saveBtn').textContent = 'Update';
       };
-        
+
       const del=document.createElement('button');
       del.className='iconBtn';
       del.textContent='Delete';
-      del.onclick=async()=>{await apiDeleteEntry(entry.id); await refreshAll();};
-        
+      del.onclick=async()=>{
+        await jget(`/api/entries/${entry.id}/delete`);
+        await refreshAll();
+      };
+
       actions.appendChild(edit);
       actions.appendChild(del);
-
 
       div.appendChild(left); div.appendChild(actions); log.appendChild(div);
     }
   }
 
   async function renderHistogram(){
-    const hist=await apiGetHistogramAll();
+    const hist=await jget('/api/histogram/all');
     drawHourChart(hist.counts||Array(24).fill(0));
     document.getElementById('chartTitle').textContent=`Meals by hour (24 bars) — All time (${hist.total_entries||0} entries)`;
   }
 
   async function renderSummary(){
     const dayIso=isoDate(state.date);
-    const s=await apiGetSummary(dayIso);
+    const s=await jget(`/api/summary?day=${encodeURIComponent(dayIso)}`);
     document.getElementById('kpiDay').textContent=kcal(s.day_total||0);
     document.getElementById('kpiWeek').textContent=kcal(s.week_total||0);
     document.getElementById('kpiMonth').textContent=kcal(s.month_total||0);
     document.getElementById('kpiAll').textContent=kcal(s.all_total||0);
-    document.getElementById('kpiAvg').textContent=kcal(s.avg_daily||0);
-    document.getElementById('kpiAvg').textContent =`${kcal(s.avg_daily||0)}${s.days_with_entries ? ` (${s.days_with_entries}d)` : ''}`;
+    document.getElementById('kpiAvg').textContent = `${kcal(s.avg_daily||0)}${s.days_with_entries ? ` (${s.days_with_entries}d)` : ''}`;
   }
 
   async function refreshAll(){
-    await renderLog();
-    await renderSummary();
-    await renderHistogram();
+    try{
+      showDbWarn(false);
+      await renderLog();
+      await renderSummary();
+      await renderHistogram();
+    }catch(e){
+      showDbWarn(true);
+      console.warn(e);
+    }
   }
 
   document.getElementById('saveBtn').onclick=async()=>{
@@ -528,40 +563,58 @@ PAGE = r"""
       calories: clampInt(document.getElementById('calories').value,0),
     };
 
-    if(state.editingId){
-      await apiUpdateEntry(state.editingId, payload);
-      state.editingId = null;
-      document.getElementById('saveBtn').textContent = 'Save';
-    } else {
-      await apiAddEntry(payload);
-    }
-    
+    try{
+      showDbWarn(false);
+      if(state.editingId){
+        await jsend(`/api/entries/${state.editingId}`, 'PUT', payload);
+        state.editingId = null;
+        document.getElementById('saveBtn').textContent = 'Save';
+      } else {
+        await jsend('/api/entries', 'POST', payload);
+      }
       document.getElementById('note').value='';
       document.getElementById('calories').value='';
       await refreshAll();
-    };
+    }catch(e){
+      showDbWarn(true);
+    }
+  };
 
   document.getElementById('saveNowBtn').onclick=async()=>{
     const dayIso=isoDate(state.date);
     const now=new Date();
     const ts=new Date(dayIso+"T00:00:00");
     if(isoDate(now)===dayIso){ts.setHours(now.getHours(),now.getMinutes(),0,0);} else {ts.setHours(12,0,0,0);}
-    await apiAddEntry({
-      day: dayIso, meal: state.meal, ts: ts.getTime(),
-      note: document.getElementById('note').value||'',
-      calories: clampInt(document.getElementById('calories').value,0),
-    });
-    document.getElementById('note').value='';
-    document.getElementById('calories').value='';
-    await refreshAll();
+
+    try{
+      showDbWarn(false);
+      await jsend('/api/entries','POST',{
+        day: dayIso, meal: state.meal, ts: ts.getTime(),
+        note: document.getElementById('note').value||'',
+        calories: clampInt(document.getElementById('calories').value,0),
+      });
+      document.getElementById('note').value='';
+      document.getElementById('calories').value='';
+      await refreshAll();
+    }catch(e){
+      showDbWarn(true);
+    }
   };
 
   document.getElementById('clearDayBtn').onclick=async()=>{
     const dayIso=isoDate(state.date);
     if(!confirm('Clear all entries for this day?'))return;
-    await apiClearDay(dayIso);
-    await refreshAll();
+    try{
+      showDbWarn(false);
+      await jget(`/api/entries/clear?day=${encodeURIComponent(dayIso)}`);
+      await refreshAll();
+    }catch(e){
+      showDbWarn(true);
+    }
   };
+
+  document.getElementById('exportMealsBtn').onclick = () => { window.location.href='/export/meals.csv'; };
+  document.getElementById('exportHistoBtn').onclick = () => { window.location.href='/export/histogram.csv'; };
 
   document.getElementById('prevDay').onclick=async()=>{state.date=new Date(state.date.getTime()-86400000); await refreshAll();};
   document.getElementById('nextDay').onclick=async()=>{state.date=new Date(state.date.getTime()+86400000); await refreshAll();};
@@ -583,14 +636,28 @@ PAGE = r"""
 """
 
 
-# ==================== routes ====================
+# -------------------- Routes --------------------
+
 @app.get("/")
 def index():
+    # Root should always load fast; DB can fail later without taking the UI down.
     return render_template_string(PAGE)
+
+
+@app.get("/healthz")
+def healthz():
+    try:
+        ensure_db_ready()
+        with db() as conn:
+            conn.execute("SELECT 1").fetchone()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 503
 
 
 @app.get("/api/entries")
 def get_entries():
+    ensure_db_ready()
     day = request.args.get("day") or iso_today()
     with db() as conn:
         rows = conn.execute(
@@ -602,6 +669,7 @@ def get_entries():
 
 @app.post("/api/entries")
 def add_entry():
+    ensure_db_ready()
     data = request.get_json(force=True, silent=False)
 
     day = str(data.get("day") or "").strip()
@@ -634,14 +702,9 @@ def add_entry():
     return jsonify({"ok": True, "id": int(row["id"])})
 
 
-@app.delete("/api/entries/<int:entry_id>")
-def delete_entry(entry_id: int):
-    with db() as conn:
-        conn.execute("DELETE FROM entries WHERE id=%s", (entry_id,))
-    return jsonify({"ok": True})
-
 @app.put("/api/entries/<int:entry_id>")
 def update_entry(entry_id: int):
+    ensure_db_ready()
     data = request.get_json(force=True, silent=False)
 
     day = str(data.get("day") or "").strip()
@@ -681,8 +744,18 @@ def update_entry(entry_id: int):
 
     return jsonify({"ok": True, "id": int(row["id"])})
 
-@app.post("/api/entries/clear")
+
+@app.get("/api/entries/<int:entry_id>/delete")
+def delete_entry(entry_id: int):
+    ensure_db_ready()
+    with db() as conn:
+        conn.execute("DELETE FROM entries WHERE id=%s", (entry_id,))
+    return jsonify({"ok": True})
+
+
+@app.get("/api/entries/clear")
 def clear_day():
+    ensure_db_ready()
     day = request.args.get("day") or iso_today()
     with db() as conn:
         conn.execute("DELETE FROM entries WHERE day=%s", (day,))
@@ -691,10 +764,13 @@ def clear_day():
 
 @app.get("/api/histogram/all")
 def histogram_all():
+    ensure_db_ready()
     counts = [0] * 24
     with db() as conn:
         rows = conn.execute("SELECT ts FROM entries").fetchall()
 
+    # Server timezone histogram (simple). If you want true "user local" histogram,
+    # we can store timezone offset per entry.
     for r in rows:
         hour = datetime.fromtimestamp(int(r["ts"]) / 1000.0).hour
         counts[hour] += 1
@@ -704,6 +780,7 @@ def histogram_all():
 
 @app.get("/api/summary")
 def summary():
+    ensure_db_ready()
     day_str = request.args.get("day") or iso_today()
     try:
         d = parse_iso_day(day_str)
@@ -717,10 +794,20 @@ def summary():
         day_total = sum_calories_between(conn, d, d)
         week_total = sum_calories_between(conn, w0, w1)
         month_total = sum_calories_between(conn, m0, m1)
-        all_total = int(conn.execute("SELECT COALESCE(SUM(calories),0) AS total FROM entries").fetchone()["total"] or 0)
-        days_with_entries = int(conn.execute("SELECT COUNT(DISTINCT day) AS c FROM entries").fetchone()["c"] or 0)
-        avg_daily = round(all_total / days_with_entries) if days_with_entries > 0 else 0
-    
+
+        all_total = int(
+            conn.execute("SELECT COALESCE(SUM(calories),0) AS total FROM entries")
+            .fetchone()["total"]
+            or 0
+        )
+        days_with_entries = int(
+            conn.execute("SELECT COUNT(DISTINCT day) AS c FROM entries")
+            .fetchone()["c"]
+            or 0
+        )
+
+    avg_daily = round(all_total / days_with_entries) if days_with_entries > 0 else 0
+
     return jsonify(
         {
             "day": day_str,
@@ -734,37 +821,48 @@ def summary():
     )
 
 
-@app.get("/export/entries.csv")
-def export_entries_csv():
+# -------------------- CSV exports --------------------
+
+@app.get("/export/meals.csv")
+def export_meals_csv():
+    ensure_db_ready()
     with db() as conn:
-        rows = conn.execute("SELECT id, day, meal, ts, note, calories FROM entries ORDER BY day ASC, ts ASC").fetchall()
+        rows = conn.execute(
+            "SELECT id, day, meal, ts, note, calories FROM entries ORDER BY day ASC, ts ASC"
+        ).fetchall()
 
-    lines = ["id,day,meal,ts_iso,ts_ms,calories,note"]
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["id", "day", "meal", "ts_ms", "calories", "note"])
     for r in rows:
-        dt_local = datetime.fromtimestamp(int(r["ts"]) / 1000.0)
-        ts_iso = dt_local.strftime("%Y-%m-%d %H:%M:%S")
-        meal = (r["meal"] or "").replace('"', '""')
-        note = (r["note"] or "").replace('"', '""')
-        cal = int(r["calories"] or 0)
-        lines.append(f'{r["id"]},{r["day"]},"{meal}",{ts_iso},{r["ts"]},{cal},"{note}"')
+        w.writerow([r["id"], r["day"], r["meal"], int(r["ts"]), int(r["calories"] or 0), r["note"] or ""])
 
-    data = "\n".join(lines) + "\n"
-    return Response(data, mimetype="text/csv", headers={"Content-Disposition": 'attachment; filename="entries.csv"'})
+    return Response(
+        out.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="meals.csv"'},
+    )
 
 
-@app.get("/export/histogram_24h.csv")
-def export_histogram_24h_csv():
+@app.get("/export/histogram.csv")
+def export_histogram_csv():
+    ensure_db_ready()
     counts = [0] * 24
     with db() as conn:
         rows = conn.execute("SELECT ts FROM entries").fetchall()
+
     for r in rows:
         hour = datetime.fromtimestamp(int(r["ts"]) / 1000.0).hour
         counts[hour] += 1
 
-    lines = ["hour,count"] + [f"{h},{counts[h]}" for h in range(24)]
-    data = "\n".join(lines) + "\n"
-    return Response(data, mimetype="text/csv", headers={"Content-Disposition": 'attachment; filename="histogram_24h.csv"'})
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["hour", "count"])
+    for h in range(24):
+        w.writerow([h, counts[h]])
 
-
-# IMPORTANT: make sure the table exists when Gunicorn imports this module
-init_db()
+    return Response(
+        out.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="histogram.csv"'},
+    )
